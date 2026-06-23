@@ -24,6 +24,23 @@ HISTORY = [Path.home() / ".claude" / "projects", Path.home() / ".codex"]
 # moves anything they'd rather keep friends-only. The public/friends split is a CHOICE, decided with the agent.
 _STOP =set("the and for that this with you your из для как что это под про или но не на по от до the a an of "
             "to in is are how do can what когда где почему мне мой если же бы то так вот они мы вы он она".split())
+# Discourse-glue + tool/transcript scaffolding (RU possessives/modals/imperatives + EN connectives + CC/git tool
+# keys). Stopping these COLLAPSES whole families of noise bigrams ("давай сделаем", "glob grep", "tool uses") before
+# they ever form. Every token was adversarially checked against the real-memory preserve set — only "parameter"
+# (kills PEFT) and "worktree" (legit DevOps topic) collided and were deliberately LEFT OUT. Extend via JM_STOP_EXTRA.
+_STOP |= set((
+    "твой твоя твоё твое твоего твоей твоих твою твоим твоими твоём твоем свой своя своё свое своего своему своим "
+    "своими своих своей наш наша наше нашего нашему нашем нашей наших нашим нашими тебе тебя тобой меня мне мной вам "
+    "вас вами нам нас нами надо нужно нужен нужна нужны нужные можно хочешь хочется хочу должен должна должны давай "
+    "давайте сделаем сделай сделать сделаю плиз глянь глянем глянуть кажется можешь можете проверю проверим проверь "
+    "проверить посмотрю посмотрим посмотри зайду зайди погоди погнали покажи покажу думаю думаем думаешь делай готов "
+    "готова готово готовы короче вообще просто кстати конечно наверное видимо значит типа сейчас прямо потом после "
+    "сначала теперь пока уже сразу rather than else each other others most recent anything everything something "
+    "nothing someone anyone everyone then now just really actually basically maybe probably literally simply going "
+    "want wants lets done made makes gets keeps started toolu output-file local-command command-args command-name "
+    "command-message pretooluse posttooluse caveat subagent sub-agent task-notification task-id cwd stdin glob grep "
+    "webfetch websearch stdout stderr multiedit notebookedit commit push origin rebase stash checkout workflows "
+    + os.environ.get("JM_STOP_EXTRA", "")).split())
 # A candidate topic LABEL is never appropriate to PROPOSE if it names a credential, a client/company, revenue, or
 # personal contact — even when it appears in otherwise-public prose. Dropped from every distillation path. Generic
 # terms (creds/revenue/email) protect everyone; a few owner-specific stems (clients, internal hostnames) are
@@ -35,8 +52,54 @@ _LABEL_DENY = re.compile(
      r"aiconic|georgia|\bdeals?\b|outsource|revenue|\bmrr\b|\barr\b|invoice|оборот|выручк|"  # business/private
      r"gmail|kustyuka|@|"                                                   # personal contact
      r"miracle|hydra|"                                                      # internal host names
-     r"[0-9a-f]{8}-[0-9a-f]{4}|\b\d{5,}\b|\b[0-9a-f]{12,}\b"),              # UUIDs / long numeric IDs / hex hashes = noise
+     r"[0-9a-f]{8}-[0-9a-f]{4}|\b\d{5,}\b|\b[0-9a-f]{12,}\b|"               # UUIDs / long numeric IDs / hex hashes = noise
+     # ── owner/teammate IDENTITY + filesystem paths (would PUBLISH a person/path on --register; FP cost ≈ 0) ──
+     r"-users-|desktop-llm|\byuka\w*|kust|\bкуст\w*|linkedin yuka|"   # owner handle (incl. yuka2/vakust fragments)
+     r"\b(igor|vitalik|vitaly|vadim|evgeniy|evgeny|dima)\b|igor-brain|(?<![а-яё])(игор|витал|вадим|евген)[а-яё]*|"
+     r"\bдим[аыуой]\b|\bром[аыеу]\b|"                                       # exact declensions (spare роман/видимость)
+     # ── infra/host/internal-product scaffolding that reads as a topic but isn't a routable human skill ──
+     r"claude-50\d|\bprivate claude\b|\bloopback\b|\blocalhost\b|\bport \d{2,5}\b|\bpinock\b|orange polska|"
+     r"joinmultiplayer|\bmultiplayer\w*|"
+     r"(?:^|\s)--?[a-z]|^\d{1,4}$"),                                        # CLI flags / path slugs / bare year-or-port
     re.I)
+# Model/tech stems that LOOK like high-entropy gibberish but are legit (qwen3-14b, rugpt3medium, 5bmodule, fpl8warsaw,
+# gte-qwen2-1) — an allowlist guard so the structural noise predicates below CAN'T eat a real model name.
+_MODEL_STEMS = re.compile(
+    r"qwen|llama|chatglm|rugpt|gpt|bge|gte|mistral|falcon|gemma|moe|flux|dora|lora|clip|bm25|fts|sha256|ed25519|"
+    r"win95|i18n|ipv4|p2p|era\d|v100|3090|4090|coder|embedding|instruct|turbo|module|warsaw|vibecoder|cosmos|turk|"
+    r"deepseek|phi|olmo|smol|kimi|eva|oss|safetensors", re.I)
+_HEX_ALLOW = re.compile(r"ed25519|sha256|sha1\b|sha512|\bmd5\b|blake|crc32|base64|base32", re.I)
+
+
+def _label_script(tok: str) -> str | None:
+    s = re.sub(r"[^a-zа-яё]", "", tok.lower())
+    hc = bool(re.search(r"[а-яё]", s)); hl = bool(re.search(r"[a-z]", s))
+    if hc and hl: return "mixed"
+    if hc: return "cyr"
+    if hl: return "lat"
+    return None
+
+
+def _struct_noise(t: str) -> bool:
+    """Structural noise that can't be a flat regex alternation (needs allowlist-first guards / script comparison).
+    Returns True to DROP. Three rules, all empirically tuned against the real corpus + preserve set:
+      1) high-entropy auth/room-token gibberish (wpzh715ay, yuka2671) — but spare model names via _MODEL_STEMS.
+      2) clause-boundary cross-script bigram (Cyrillic word + Latin word), but NOT hyphen-compounds
+         (spares 'control-plane реестр', 'data-plane федеративный').
+      3) short git-SHA / object-id hex run (7-11 chars), but spare crypto terms via _HEX_ALLOW."""
+    # 1) high-entropy single token
+    if " " not in t and "-" not in t and re.fullmatch(r"[a-z0-9]{7,}", t) \
+            and re.search(r"[0-9]", t) and re.search(r"[g-z]", t) and not _MODEL_STEMS.search(t):
+        return True
+    # 2) cross-script bare bigram
+    parts = t.split(" ")
+    if len(parts) == 2 and "-" not in parts[0] and "-" not in parts[1] \
+            and {_label_script(parts[0]), _label_script(parts[1])} == {"cyr", "lat"}:
+        return True
+    # 3) short SHA / object-id
+    if not _HEX_ALLOW.search(t) and re.search(r"\b[0-9a-f]{7,11}\b", t, re.I):
+        return True
+    return False
 
 
 def _read_history(max_chars: int = 1_500_000) -> str:
@@ -117,8 +180,9 @@ def _distill(text: str) -> list[str]:
     for w, c in uni.most_common():                # every meaningful frequent unigram
         if w not in seen and c > 3:
             topics.append(w); seen.add(w)
-    # drop sensitive candidate labels (credentials / clients / revenue / personal contact) — never propose them
-    return [t for t in topics if not _LABEL_DENY.search(t)]
+    # drop sensitive candidate labels (credentials / clients / revenue / personal contact) + structural noise
+    # (auth-token gibberish / cross-script clause fragments / short git-SHAs) — never propose them
+    return [t for t in topics if not _LABEL_DENY.search(t) and not _struct_noise(t)]
 
 
 # Narrow business/client/money/personal stems → DEFAULT to friends (so a lazy "go" lands on the SAFER split, not
@@ -130,6 +194,11 @@ _FRIENDS_DEFAULT = re.compile(
      r"\b(sales|pricing|price|contract|revenue|mrr|arr|invoice|billing|client|customer|deal|salary|tax|visa|"
      r"business|commercial|startup|founder|proprietary|confidential|client[\- ]?work)\b"),
     re.I)
+
+
+# the BARE proposal print (no agent in the loop) shows the top-N most-frequent labels, not all ~10k — a reviewable,
+# non-overwhelming, less-noisy set. The --onboard path (where the agent is the real distiller) seeds from more. Env.
+_PROPOSE_CAP = int(os.environ.get("JM_PROPOSE_CAP", "60"))
 
 
 def _propose(topics: list[str]) -> dict:
@@ -299,6 +368,33 @@ def build_public_view() -> tuple[int, int]:
             except Exception:
                 pass
     return kept, excl
+
+
+def _onboarding_text(max_chars: int = 2_000_000) -> tuple[str, str, int, int]:
+    """The text to distill onboarding TOPIC SEEDS from. PREFER curated, private-filtered memory notes (build_public_view
+    mirrors **/memory/*.md MINUS private globs): they're dense, deduped expertise AND structurally exclude private
+    files — whereas raw .jsonl session transcripts are ~3000× larger, so frequency-ranking over them surfaces CC
+    session-mechanics ("tool uses", "agent count", "duration usage") and can even surface sensitive tokens as
+    candidate labels. Fall back to raw history ONLY if there are no memory notes at all (so memory-less users still
+    work). Strips YAML frontmatter so 'type/metadata/name/description' keys don't become fake topics.
+    Returns (text, source, kept, excluded)."""
+    try:
+        kept, excl = build_public_view()
+    except Exception:
+        kept = excl = 0
+    parts = []
+    for p in sorted(PUBLIC_VIEW.glob("*.md")):
+        try:
+            t = p.read_text("utf-8", errors="ignore")
+        except Exception:
+            continue
+        t = re.sub(r"^\s*---\s*\n.*?\n---\s*\n", " ", t, count=1, flags=re.S)      # YAML frontmatter block
+        t = re.sub(r"(?im)^\s*(name|description|metadata|type)\s*:.*$", " ", t)    # stray frontmatter keys
+        parts.append(t)
+    text = "\n\n".join(parts)
+    if len(text) >= 200:
+        return text[:max_chars], "curated-memory", kept, excl
+    return _read_history(), "raw-history", kept, excl
 
 
 def _gather_public_context(question: str, budget: int = 80_000, per_file: int = 12_000) -> str:
@@ -744,11 +840,8 @@ def _onboard(a) -> None:
     if not (a.public or a.friends):
         # distill from the PRIVATE-FILTERED curated memory, NOT raw transcripts — .jsonl sessions are full of tool/
         # path noise and can surface sensitive tokens ("brain password", "basic auth") as candidate labels. Fall back
-        # to raw history only if there are no memory notes at all.
-        kept, excl = build_public_view()
-        text = "\n\n".join(p.read_text("utf-8", errors="ignore") for p in sorted(PUBLIC_VIEW.glob("*.md")))
-        if len(text) < 200:
-            text = _read_history()
+        # to raw history only if there are no memory notes at all. (Shared with the bare path via _onboarding_text.)
+        text, _src, kept, excl = _onboarding_text()
         if len(text) < 200:
             print(json.dumps({"step": "propose", "topics": {"public": [], "friends": []},
                               "note": "No local AI history found — nothing to distill. You can still --ask."},
@@ -947,7 +1040,7 @@ def main() -> None:
         text = _read_chatgpt_export(a.import_chatgpt)
         if len(text) < 200:
             print("  couldn't read that ChatGPT export — point at conversations.json or the export .zip."); return
-        split = _propose(_distill(text))
+        split = _propose(_distill(text)[:_PROPOSE_CAP])
         print(json.dumps({"proposed": split, "source": "chatgpt-export",
                           "rule": "≥10% public; nothing uploaded — distilled locally"}, ensure_ascii=False, indent=2))
         print("\n  register: python3 join.py --register --token <T> --public \"...\" --friends \"...\"")
@@ -1031,11 +1124,15 @@ def main() -> None:
         split = {"public": [x.strip() for x in a.public.split(",") if x.strip()],
                  "friends": [x.strip() for x in a.friends.split(",") if x.strip()]}
     else:
-        text = _read_history()
+        text, _src, _kept, _excl = _onboarding_text()
         if len(text) < 200:
             print("  no AI history found locally (Claude Code / Codex). Nothing to distill — you can still ASK.")
             return
-        split = _propose(_distill(text))
+        all_topics = _distill(text)
+        split = _propose(all_topics[:_PROPOSE_CAP])
+        if len(all_topics) > _PROPOSE_CAP:
+            print(f"  (showing the top {_PROPOSE_CAP} of {len(all_topics)} distilled topics — edit freely before "
+                  f"--register; the --onboard flow lets your agent curate the full set)")
     print(json.dumps({"proposed": split, "rule": "≥10% public (give-to-get); raw history never leaves device"},
                      ensure_ascii=False, indent=2))
     if a.register:
