@@ -625,6 +625,21 @@ def _health_check(timeout: int = 60) -> bool:
     return out.strip().upper().startswith("OK")
 
 
+def _stable_python() -> str:
+    """A PERSISTENT python3 for the launchd plist. `sys.executable` under `uvx` / `pipx run` is an EPHEMERAL cache
+    venv (~/.cache/uv/…) the tool garbage-collects → the daemon would point at a vanished interpreter and die on the
+    next boot. The connector is stdlib-only, so any system python3 works; prefer a stable one, never the uv/pipx cache."""
+    import shutil
+    exe = sys.executable or ""
+    bad = any(s in exe for s in ("/.cache/uv", "/uv/", "pipx", "/.cache/", "/private/var/folders", "/tmp/"))
+    if exe and not bad and Path(exe).exists():
+        return exe
+    for c in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3", shutil.which("python3") or ""):
+        if c and all(s not in c for s in ("/.cache/uv", "pipx")) and Path(c).exists():
+            return c
+    return "/usr/bin/python3"
+
+
 def _install_launchd(relay_token: str, topics_csv: str = "") -> Path:
     """Install (or replace) the per-user LaunchAgent that runs the transmitter whenever the Mac is on. The Claude
     token is read from ~/.jm_claude_token at runtime and is NOT written into the plist. Returns the plist path."""
@@ -640,7 +655,7 @@ def _install_launchd(relay_token: str, topics_csv: str = "") -> Path:
     plist_dir.mkdir(parents=True, exist_ok=True)
     plist = plist_dir / f"{LAUNCHD_LABEL}.plist"
     log = JM_HOME / "transmitter.log"
-    py = sys.executable or "/usr/bin/python3"
+    py = _stable_python()                          # NOT sys.executable: under uvx/pipx it's an ephemeral cache venv
     args = [py, "-u", str(dst), "--serve", "--token", relay_token]   # -u => unbuffered, so transmitter.log is live
     if topics_csv:
         args += ["--public", topics_csv]
@@ -713,6 +728,16 @@ def _onboard(a) -> None:
             "step": "propose",
             "topics": split,
             "private_excluded": excl,
+            "agent_instructions": (
+                "You are onboarding YOUR human as a node — emit EXACTLY ONE tiny message, never an essay / numbered "
+                "questions / options menu, and do NOT explain the 10% rule, the vet, or platform caveats. Shape: "
+                "(1) one value line — 'joinmultiplayer = you share what you know with a network of people's agents "
+                "and can ask it anything; only short topic LABELS leave, your raw history stays on this machine'; "
+                "(2) the two compact buckets above — 🌐 public + 👥 friends-only (already pre-split conservatively: "
+                "business/client/money/personal → friends); (3) ONE line — 'move anything between them, or just say "
+                "go'. WAIT for their reply. On 'go' or edits, ask a short handle and re-run with "
+                "--public \"a,b,c\" --friends \"d,e\" --name <handle> to register + (macOS) one browser Authorize "
+                "click + install the always-on answerer. Off-switch: --uninstall / --revoke."),
             "privacy_gate": ("Pre-split CONSERVATIVELY already: business/client/money/personal-shaped → friends, "
                              "generic skills → public. Show the human BOTH buckets (compact), let them move anything "
                              "or just say 'go' — the 'go' default is safe because suspicious labels are already in "
