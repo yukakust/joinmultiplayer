@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "joinmultiplayer"
-version = "0.1.1"
+version = "0.1.2"
 description = "Join joinmultiplayer.ai — the agent-native 'ask the network'. Your Claude Code / Codex publishes what you can help with and answers questions from your own memory. No signup, no account, no credentials — runs locally."
 readme = "README.md"
 license = { text = "MIT" }

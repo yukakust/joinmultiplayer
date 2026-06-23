@@ -519,8 +519,18 @@ def _mint_claude_token(timeout: int = 200, opener=None) -> str:
     """Run `claude setup-token` in a WIDE PTY (so the TUI never wraps the token line), open the OAuth URL for the
     human's ONE Authorize click, strip ANSI, and scrape a FULL-length `sk-ant-oat01-…` token. Returns it or ''
     (caller falls back to manual paste). NEVER reconstructs. The human always clicks Authorize themselves."""
-    import pty, select, subprocess, time, fcntl, termios, struct
-    opener = opener or (lambda u: subprocess.run(["open", u], check=False, capture_output=True))
+    import platform, subprocess
+    if platform.system() == "Windows":          # pty/fcntl/termios are Unix-only → don't crash; manual-paste path
+        return ""
+    try:
+        import pty, select, time, fcntl, termios, struct
+    except Exception:                            # any env without the Unix tty modules → manual paste
+        return ""
+    def _open(u):                                # cross-platform best-effort browser open (mac `open`, linux `xdg-open`)
+        cmd = {"Darwin": ["open", u], "Linux": ["xdg-open", u]}.get(platform.system(), ["open", u])
+        try: subprocess.run(cmd, check=False, capture_output=True, timeout=10)
+        except Exception: pass
+    opener = opener or _open
     bin_ = _claude_bin()
     try:
         master, slave = pty.openpty()
@@ -562,7 +572,10 @@ def _mint_claude_token(timeout: int = 200, opener=None) -> str:
                 if not opened:
                     m = url_re.search(clean)
                     if m and ("claude.ai" in m.group(0) or "anthropic" in m.group(0)):
-                        opener(m.group(0).rstrip(').,\'"\n'))
+                        _url = m.group(0).rstrip(').,\'"\n')
+                        print(f"\n  🔐 Click Authorize in your browser (open this manually if it didn't pop):\n"
+                              f"     {_url}\n", flush=True)
+                        opener(_url)
                         opened = True
                 m2 = tok_re.search(clean)
                 if m2:
@@ -703,6 +716,21 @@ def _do_revoke() -> None:
           "Settings). Without it the transmitter cannot answer.")
 
 
+def _suggested_handle() -> str:
+    """A default node handle so the agent never BLOCKS asking for --name: git user.name → $USER, sanitized."""
+    import subprocess, getpass
+    cand = ""
+    try:
+        cand = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        cand = ""
+    if not cand:
+        try: cand = getpass.getuser()
+        except Exception: cand = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    cand = (cand or "").lower().split(" ")[0]
+    return re.sub(r"[^a-z0-9_\-]", "", cand)
+
+
 def _onboard(a) -> None:
     """The self-driving connector the agent runs once. TWO human touchpoints only: the privacy split (decided BEFORE
     this call and passed as --public/--friends) and the single browser Authorize click during token mint. Staged +
@@ -728,6 +756,7 @@ def _onboard(a) -> None:
             "step": "propose",
             "topics": split,
             "private_excluded": excl,
+            "suggested_handle": _suggested_handle(),
             "agent_instructions": (
                 "You are onboarding YOUR human as a node — emit EXACTLY ONE tiny message, never an essay / numbered "
                 "questions / options menu, and do NOT explain the 10% rule, the vet, or platform caveats. Shape: "
@@ -735,9 +764,10 @@ def _onboard(a) -> None:
                 "and can ask it anything; only short topic LABELS leave, your raw history stays on this machine'; "
                 "(2) the two compact buckets above — 🌐 public + 👥 friends-only (already pre-split conservatively: "
                 "business/client/money/personal → friends); (3) ONE line — 'move anything between them, or just say "
-                "go'. WAIT for their reply. On 'go' or edits, ask a short handle and re-run with "
-                "--public \"a,b,c\" --friends \"d,e\" --name <handle> to register + (macOS) one browser Authorize "
-                "click + install the always-on answerer. Off-switch: --uninstall / --revoke."),
+                "go'. WAIT for their reply. On 'go' (or after applying their edits) re-run IMMEDIATELY — do NOT ask "
+                "anything else (use `suggested_handle` for --name if they didn't give one) — with: "
+                "`uvx joinmultiplayer --onboard --public \"a,b,c\" --friends \"d,e\" --name <handle>`. That registers "
+                "them + (macOS) one browser Authorize click + installs the always-on answerer. Off: --uninstall / --revoke."),
             "privacy_gate": ("Pre-split CONSERVATIVELY already: business/client/money/personal-shaped → friends, "
                              "generic skills → public. Show the human BOTH buckets (compact), let them move anything "
                              "or just say 'go' — the 'go' default is safe because suspicious labels are already in "
@@ -799,14 +829,24 @@ def _onboard(a) -> None:
         print(f"  ✓ registered as '{res.get('handle','you')}'")
     _register({"public": public, "friends": friends}, token)
 
-    # ── STAGE 5 — install the always-on transmitter. Describe exactly what runs BEFORE writing the LaunchAgent.
-    print("\n  Installing the transmitter (a LaunchAgent — runs ONLY while your Mac is on). It will run:")
-    print(f"     python3 {JM_HOME / 'join.py'} --serve")
-    print( "     → polls the network, answers PUBLIC-topic questions from your notes (no tools, inline public text "
-           "only), with a fail-closed redactor before anything posts. Sensitive/friends questions are parked for you.")
-    plist = _install_launchd(token, topics_csv=",".join(public))
-    print(f"  ✓ installed: {plist}   (logs → {JM_HOME / 'transmitter.log'})")
-    print("\n  🛰  You're live — online whenever this Mac is on; your agent answers public questions without asking.")
+    # ── STAGE 5 — always-on transmitter. macOS = launchd; other OSes don't have it wired yet → register-only +
+    #    HONEST message (never a silently-dead node). Cross-OS service (systemd/schtasks) is the next build.
+    import platform as _plat
+    if _plat.system() == "Darwin":
+        print("\n  Installing the transmitter (a LaunchAgent — runs ONLY while your Mac is on). It will run:")
+        print(f"     python3 {JM_HOME / 'join.py'} --serve")
+        print( "     → polls the network, answers PUBLIC-topic questions from your notes (no tools, inline public text "
+               "only), with a fail-closed redactor before anything posts. Sensitive/friends questions are parked for you.")
+        plist = _install_launchd(token, topics_csv=",".join(public))
+        print(f"  ✓ installed: {plist}   (logs → {JM_HOME / 'transmitter.log'})")
+        print("\n  🛰  You're live — online whenever this Mac is on; your agent answers public questions without asking.")
+    else:
+        print(f"\n  ✓ Registered as a node — but the ALWAYS-ON auto-answerer is macOS-only for now (cross-OS service is "
+              f"coming; honest about it so you're never 'online but silently answering nothing').")
+        print(f"  On {_plat.system()} you answer on your terms:")
+        print(f"     run it live : python3 {JM_HOME / 'join.py'} --serve --token <relay-token from {JM_HOME / 'relay_token'}>")
+        print(f"     or by hand  : --inbox (see questions routed to you) → --answer <qid> --text \"...\"")
+        print(f"  And you can ASK the network now:  --ask \"your question\"  ·  read replies:  --inbox")
     print( "  Off-switch any time:")
     print(f"     stop/pause : python3 {JM_HOME / 'join.py'} --uninstall")
     print(f"     revoke key : python3 {JM_HOME / 'join.py'} --revoke")
