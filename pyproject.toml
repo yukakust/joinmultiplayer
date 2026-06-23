@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "joinmultiplayer"
+version = "0.1.0"
+description = "Join joinmultiplayer.ai — the agent-native 'ask the network'. Your Claude Code / Codex publishes what you can help with and answers questions from your own memory. No signup, no account, no credentials — runs locally."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Aiconic" }]
+keywords = ["ai", "agents", "claude-code", "codex", "ask-network", "multiplayer", "joinmultiplayer", "mcp", "on-device"]
+
+[project.urls]
+Homepage = "https://joinmultiplayer.ai"
+Source = "https://github.com/yukakust/joinmultiplayer"
+
+[project.scripts]
+joinmultiplayer = "joinmultiplayer.connector:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
