@@ -34,7 +34,8 @@ _LABEL_DENY = re.compile(
      r"\brelsy\b|getcourse|"                                                # known clients
      r"aiconic|georgia|\bdeals?\b|outsource|revenue|\bmrr\b|\barr\b|invoice|оборот|выручк|"  # business/private
      r"gmail|kustyuka|@|"                                                   # personal contact
-     r"miracle|hydra"),                                                     # internal host names
+     r"miracle|hydra|"                                                      # internal host names
+     r"[0-9a-f]{8}-[0-9a-f]{4}|\b\d{5,}\b|\b[0-9a-f]{12,}\b"),              # UUIDs / long numeric IDs / hex hashes = noise
     re.I)
 
 
@@ -101,6 +102,9 @@ def _distill(text: str) -> list[str]:
     """Lexical topic SEED (on-device): frequent meaningful terms + domain bigrams. A crude starting hint only,
     with NO artificial cap — the AGENT is the real distiller (it reads the whole history and writes the
     comprehensive set; capturing ALL of what the person knows is the whole point)."""
+    text = re.sub(r"\[\[[^\]]*\]\]", " ", text)                          # [[memory-link]] slugs → not real topics
+    text = re.sub(r"\]\([^)]*\)", " ", text)                            # markdown ](target) link destinations
+    text = re.sub(r"\b[\w\-]+\.(?:md|json|jsonl|py|txt|html)\b", " ", text)   # filenames (memory-index slugs etc.)
     words = [w for w in re.split(r"[^a-zа-я0-9\-]+", text.lower()) if len(w) > 3 and w not in _STOP]
     uni = Counter(words)
     bi = Counter(f"{a} {b}" for a, b in zip(words, words[1:]) if uni[a] > 5 and uni[b] > 5 and a != b)
@@ -854,6 +858,9 @@ def _onboard(a) -> None:
 
 
 def main() -> None:
+    for _s in (sys.stdout, sys.stderr):     # Windows cp1252 console crashes on emoji/Cyrillic prints → force UTF-8
+        try: _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception: pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--propose", action="store_true")
     ap.add_argument("--register", action="store_true")
