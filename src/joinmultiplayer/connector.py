@@ -1017,8 +1017,11 @@ def _write_claude_token(tok: str) -> None:
 
 
 def _health_check(timeout: int = 60) -> bool:
-    """Validate the freshly-minted token actually drives the user's subscription before we install anything."""
-    out = _claude("Reply with exactly: OK", timeout=timeout)
+    """Validate the ACTIVE brain (claude or codex) actually answers before we install anything."""
+    b = _brain()
+    if b is None:
+        return False
+    out = b("Reply with exactly: OK", timeout=timeout) or ""
     return out.strip().upper().startswith("OK")
 
 
@@ -1167,25 +1170,39 @@ def _onboard(a) -> None:
         print(f"  ✋ public floor: at least ~10% of topics must be public (you gave {len(public)}/{total}). "
               f"Move a few to --public. Nothing installed."); return
 
-    # ── STAGE 3 — SUBSCRIPTION TOKEN FIRST. This is the step that failed before; doing it BEFORE any irreversible
-    #    relay claim means a mint failure can NEVER orphan a node / grab a "<name>2" handle. The Authorize click is here.
+    # ── STAGE 3 — BRAIN. Pick the brain by what's installed: a Claude subscription (preferred — mint the token via the
+    #    one Authorize click), else Codex (no mint — it uses its own `codex login`). Done BEFORE any irreversible relay
+    #    claim so a brain failure can never orphan a node. A Codex-only user reaches the `elif` and skips the Claude mint.
     JM_HOME.mkdir(parents=True, exist_ok=True)
-    print("\n  Your own Claude subscription becomes the brain. A browser will open — click Authorize.")
-    print("  (We never click it for you and never mint without you — that consent gate is the whole point.)")
-    if _oauth_token() and _health_check():
-        print("  ✓ an existing subscription token already works — skipping mint.")
-    else:
-        minted = _acquire_subscription_token()                  # hardened auto-scrape → validated manual-paste fallback
+    import shutil as _sh
+    if _oauth_token():                                          # Claude token already present → just verify it
+        if _health_check():
+            print("\n  ✓ Your Claude subscription is the brain — existing token works, skipping mint.")
+        else:
+            print("\n  ⚠️ Claude token present but the health check failed (try: claude -p 'say OK'). Fix or --revoke, "
+                  "then re-run --onboard."); return
+    elif _sh.which("claude"):                                  # Claude installed, no token → mint via Authorize click
+        print("\n  Your own Claude subscription becomes the brain. A browser will open — click Authorize.")
+        print("  (We never click it for you and never mint without you — that consent gate is the whole point.)")
+        minted = _acquire_subscription_token()                 # hardened auto-scrape → validated manual-paste fallback
         if not _valid_token(minted):
-            print("\n  ✋ No valid subscription token captured — NOTHING was registered or installed (no orphan left "
-                  "behind). Re-run the same --onboard command to try again.")
+            print("\n  ✋ No valid subscription token captured — NOTHING was registered or installed. Re-run --onboard.")
             return
         _write_claude_token(minted)
         if not _health_check():
-            print(f"  ⚠️  Token captured but the health check failed (try: claude -p 'say OK'). Nothing registered/"
-                  f"installed; token at {CLAUDE_TOKEN_PATH} — remove with join.py --revoke, then re-run --onboard.")
-            return
+            print(f"  ⚠️  Token captured but the health check failed (try: claude -p 'say OK'). Nothing installed; "
+                  f"token at {CLAUDE_TOKEN_PATH} — remove with join.py --revoke, then re-run."); return
         print("  ✓ subscription token verified — your agent can answer.")
+    elif _sh.which("codex"):                                   # Codex is the brain — no Claude needed, no token to mint
+        print("\n  Your Codex CLI is the brain (no Claude, no token to mint — it uses your `codex login`). Verifying…")
+        if not _health_check():                                # _health_check runs the active brain (= _codex here)
+            print("  ✋ codex didn't return a clean answer. Check `codex login` (or OPENAI_API_KEY), then try "
+                  "`python3 ~/.jm/join.py --codex-canary` to debug. Nothing registered/installed."); return
+        print("  ✓ codex verified — your agent can answer from your knowledge.")
+        print("  ℹ️  Codex node is PARK-ONLY by default (drafts → you review with --pending → --send). To AUTO-post, "
+              "run `--codex-canary` then set JM_CODEX_SANDBOX_VERIFIED=1 + JM_CODEX_AUTOPOST=1.")
+    else:
+        print("\n  ✋ No brain found. Install Claude Code (`claude`) or Codex (`codex`) and re-run --onboard."); return
 
     # ── STAGE 4 — RELAY IDENTITY, idempotent. REUSE a saved relay token if the relay still knows it (heartbeat probe)
     #    — this is what structurally prevents a re-run from self-joining AGAIN and grabbing a "<name>2" handle. Only
