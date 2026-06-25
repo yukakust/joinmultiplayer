@@ -1151,7 +1151,11 @@ def _onboard(a) -> None:
                 "go'. WAIT for their reply. On 'go' (or after applying their edits) re-run IMMEDIATELY — do NOT ask "
                 "anything else (use `suggested_handle` for --name if they didn't give one) — with: "
                 "`uvx joinmultiplayer --onboard --public \"a,b,c\" --friends \"d,e\" --name <handle>`. That registers "
-                "them + (macOS) one browser Authorize click + installs the always-on answerer. Off: --uninstall / --revoke."),
+                "them + (macOS) one browser Authorize click + installs the always-on answerer. "
+                "ONE more check first: if the human says they ALREADY joined joinmultiplayer.ai on another device/CLI, "
+                "do NOT make a new node — ask for their existing token (the line in ~/.jm/relay_token on that machine) "
+                "and ADD `--token <that token>` to the re-run, so THIS CLI attaches as a second channel to the same "
+                "identity. Off: --uninstall / --revoke."),
             "privacy_gate": ("Pre-split CONSERVATIVELY already: business/client/money/personal-shaped → friends, "
                              "generic skills → public. Show the human BOTH buckets (compact), let them move anything "
                              "or just say 'go' — the 'go' default is safe because suspicious labels are already in "
@@ -1209,7 +1213,23 @@ def _onboard(a) -> None:
     #    self-join (the one irreversible claim) when there's no live saved identity. Write-after-confirm.
     rt = JM_HOME / "relay_token"
     token = a.token
-    if not token and rt.exists():
+    if token:
+        # ATTACH: the human passed an existing identity token from another device/CLI → this CLI becomes a SECOND
+        # CHANNEL to the SAME identity (one human = one node), not a duplicate. Validate it's live, then PERSIST it so
+        # a later bare --onboard reuses it instead of minting a dup. (Persisting on attach was the missing piece — a
+        # passed --token used to NOT be written, so the next re-run silently self-joined a duplicate.) The token is a
+        # bearer secret — only ever pasted by the human, never auto-fetched.
+        try:
+            _api_post("/mp/heartbeat", {}, token)
+            rt.write_text(token + "\n", "utf-8")
+            try: os.chmod(rt, 0o600)
+            except Exception: pass
+            print("  ✓ attached this CLI as a SECOND channel to your existing identity — no duplicate node created.")
+        except Exception:
+            print("  ✋ that --token didn't validate on the relay — nothing attached. Use the token from "
+                  "~/.jm/relay_token on the device where you first joined, or omit --token to create a new node.")
+            return
+    elif rt.exists():
         saved = rt.read_text("utf-8").strip()
         if saved:
             try:
