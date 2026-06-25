@@ -382,16 +382,35 @@ def _codex(prompt: str, allowed_tools: str = "", add_dirs=(), timeout: int = 180
         sbx.mkdir(parents=True, exist_ok=True)
     except Exception:
         sbx = None
-    # VERIFY flags on the target machine via `codex exec --help` (Igor's canary step): non-interactive run +
-    # read-only sandbox + skip the git-repo check (cwd is an empty dir). Wrong flags => non-zero/empty stdout =>
-    # '' => SKIP/park downstream = fail-closed, never a leak.
-    cmd = [bin_, "exec", "--sandbox", "read-only", "--skip-git-repo-check", prompt]
+    # Invocation VERIFIED on codex-cli 0.142.0 (Yuka's Mac, 2026-06-25): `-a never` (no approval prompts) is a GLOBAL
+    # flag and must precede `exec`; the clean FINAL message is written to --output-last-message (stdout carries
+    # reasoning/log noise that would pollute the answer + break the redactor). Wrong flags / non-zero rc => '' =>
+    # SKIP/park downstream = fail-closed, never a leak. ⚠️ NOTE: on this codex, --sandbox read-only does NOT confine
+    # file READS (only writes/network-ish) — so inline-only is NOT structurally enforced here; a Codex node therefore
+    # stays PARK-ONLY (the --codex-canary file-read test fails → no autopost artifact). OS confinement (sandbox-exec)
+    # is required before a Codex node may ever auto-post; until then the human reviews every answer.
+    import tempfile
+    lastf = None
     try:
+        fd, lastp = tempfile.mkstemp(prefix="jm_codex_", suffix=".txt", dir=str(sbx) if sbx else None)
+        os.close(fd); lastf = lastp
+        cmd = [bin_, "-a", "never", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+               "--output-last-message", lastp, prompt]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env,
                            cwd=str(sbx) if sbx else None, stdin=subprocess.DEVNULL)
-        return (r.stdout or "").strip()
+        if r.returncode != 0:
+            return ""
+        try:
+            out = Path(lastp).read_text("utf-8", errors="replace").strip()
+        except Exception:
+            out = ""
+        return out or (r.stdout or "").strip()      # final-message file preferred; stdout only as a fallback
     except Exception:
         return ""
+    finally:
+        if lastf:
+            try: os.unlink(lastf)
+            except Exception: pass
 
 
 def _brain_pick():
