@@ -1470,8 +1470,13 @@ def main() -> None:
                   f"later: {token}")
         _register(split, token)
     else:
-        print("\n  adjust by telling your agent (e.g. 'move X to friends, add Docker'), then re-run with "
-              "--register --name <your-handle> --public \"...\" --friends \"...\"  (no web sign-in needed)")
+        print("\n  AGENT: this was just a read-only PREVIEW. To actually make your human a live NODE, move topics if "
+              "they ask, then re-run with --onboard (NOT bare --register — that publishes labels but installs NO "
+              "answerer = a node that never replies):\n"
+              "      uvx joinmultiplayer --onboard --name <handle> --public \"a,b,c\" --friends \"d,e\"\n"
+              "  --onboard sets up the brain (Claude or Codex) + installs the always-on answerer. If the human already "
+              "joined on ANOTHER device, attach instead of duplicating: add --token <their token from ~/.jm/relay_token "
+              "on that machine>.")
 
 
 if __name__ == "__main__":
