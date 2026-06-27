@@ -211,12 +211,29 @@ def _propose(topics: list[str]) -> dict:
     return {"public": public, "friends": friends}
 
 
+def _ssl_ctx():
+    """A working SSL context even on Windows / old Python with a STALE system CA store — the #1 onboarding hard-block
+    (`certificate has expired`). Prefer the bundled certifi CA bundle; fall back to the system default. Invisible."""
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        try:
+            return ssl.create_default_context()
+        except Exception:
+            return None
+
+
+_SSL = _ssl_ctx()
+
+
 def _self_join(name: str) -> dict:
     """CLI-first: mint a node identity + token with no web sign-in. Returns {handle, token}."""
     import urllib.request
     req = urllib.request.Request(f"{RELAY}/mp/self-join", data=json.dumps({"name": name}).encode(),
                                  headers={"Content-Type": "application/json", "User-Agent": "multiplayer/1.0"})
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=20, context=_SSL) as r:
         return json.loads(r.read())
 
 
@@ -227,7 +244,7 @@ def _register(split: dict, token: str) -> None:
     req = urllib.request.Request(f"{RELAY}/portrait", data=payload,
                                  headers={"Content-Type": "application/json", "User-Agent": "multiplayer/1.0",
                                           "Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=20, context=_SSL) as r:
         print("  registered:", r.status, "→ you're a node. Topics published (labels only; history stayed local).")
 
 
@@ -236,14 +253,15 @@ def _register(split: dict, token: str) -> None:
 # your local knowledge via an OpenAI-compatible endpoint (Ollama by default — fully local), and auto-sends it
 # for PUBLIC topics only. friends/anon questions are surfaced for your approval, never auto-answered. The raw
 # question + your context never leave the device — only the final answer text you'd send. "Your data is yours."
-POLL_SECONDS = 45
+POLL_SECONDS = int(os.environ.get("JM_POLL_SECONDS", "15"))   # faster pickup → lower end-to-end latency (was 45;
+                                                              # 45s of pure queue delay pushed worst-case past the asker's patience)
 
 
 def _api_get(path: str, token: str) -> dict:
     import urllib.request
     req = urllib.request.Request(f"{RELAY}{path}",
                                  headers={"Authorization": f"Bearer {token}", "User-Agent": "multiplayer/1.0"})
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=20, context=_SSL) as r:
         return json.loads(r.read())
 
 
@@ -252,7 +270,7 @@ def _api_post(path: str, body: dict, token: str) -> dict:
     req = urllib.request.Request(f"{RELAY}{path}", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", "User-Agent": "multiplayer/1.0",
                                           "Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with urllib.request.urlopen(req, timeout=30, context=_SSL) as r:
         return json.loads(r.read())
 
 
@@ -593,6 +611,117 @@ def _is_private(path) -> bool:
     return any(fnmatch.fnmatch(s, g.lower()) for g in PRIVATE_GLOBS)
 
 
+# ── circle v1 — the filter-then-load permission gate (mirrors bubbles/read-path/circle.py; INLINED because the
+#    connector ships as ONE file). A chunk in ~/.jm/circles/*.md may carry `audience: [handle, ...]` front-matter;
+#    it enters an asker's answer context ONLY if that authenticated asker is in the audience. Absent/empty/parse-
+#    fail/anon → DENY (fail closed). These chunks live OUTSIDE PUBLIC_VIEW and are inlined ONLY for non-network
+#    (friends/anon) questions — which are PARKED for your review, never auto-posted/showcased — so a forbidden chunk
+#    never enters the model AND circle content never rides a public answer. ──
+def _circles_dir() -> Path:
+    """Resolved lazily — JM_HOME is defined later in this file, so don't read it at import time."""
+    home = Path(os.environ.get("JM_HOME") or (Path.home() / ".jm"))
+    return Path(os.environ.get("JM_CIRCLES_DIR") or (home / "circles"))
+
+
+_FM_RE = re.compile(r"^\s*---\s*\n(.*?)\n---\s*\n?(.*)$", re.S)
+_AUD_RE = re.compile(r"^\s*audience\s*:\s*(.+?)\s*$", re.I | re.M)
+
+
+def _parse_audience(text: str):
+    """Return (audience_list | None, body). None = no `audience:` key (→ private / default-deny)."""
+    m = _FM_RE.match(text or "")
+    if not m:
+        return None, (text or "")
+    head, body = m.group(1), m.group(2)
+    a = _AUD_RE.search(head)
+    if not a:
+        return None, body
+    raw = a.group(1).strip().strip("[]")
+    return [h.strip().lower() for h in re.split(r"[,\s]+", raw) if h.strip()], body
+
+
+def _has_audience_tag(text: str) -> bool:
+    return _parse_audience(text)[0] is not None
+
+
+def _audience_tag_loose(text: str) -> bool:
+    """Belt for build_public_view ONLY: catch an `audience:` line even if the front-matter isn't byte-0 anchored (a
+    memory note with a heading/prose before the `---` fence). Errs toward NOT publishing — a false positive just
+    keeps a note out of PUBLIC_VIEW. (Do NOT use for _circle_chunks_for — there, strict top-anchored parsing is right.)"""
+    return bool(re.search(r"(?mi)^\s*audience\s*:\s*\[", (text or "")[:800]))
+
+
+def _circles_json() -> Path:
+    home = Path(os.environ.get("JM_HOME") or (Path.home() / ".jm"))
+    return Path(os.environ.get("JM_CIRCLES_JSON") or (home / "circles.json"))
+
+
+def _load_circles_json() -> dict:
+    """SOURCE-based circles (no content copying): {name: {audience:[...], include:[glob,...]}}. Point a circle at
+    EXISTING files/folders by glob; current + future matches are shared with the audience (and auto-excluded from the
+    public view). The AK-47 answer to 'give them all my files on this topic' without hand-filling a note."""
+    try:
+        d = json.loads(_circles_json().read_text("utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_glob(pattern: str) -> list:
+    import glob as _g
+    try:
+        return [Path(p) for p in _g.glob(os.path.expanduser(str(pattern)), recursive=True) if Path(p).is_file()]
+    except Exception:
+        return []
+
+
+def _circle_include_paths() -> set:
+    """Every file any circles.json circle points at (resolved). build_public_view EXCLUDES these so a circle-scoped
+    file never leaks into the public view — it is private-to-its-audience, served only via the gate."""
+    out = set()
+    for spec in _load_circles_json().values():
+        for pat in (spec.get("include") or []):
+            for p in _resolve_glob(pat):
+                try:
+                    out.add(p.resolve())
+                except Exception:
+                    pass
+    return out
+
+
+def _circle_chunks_for(asker: str) -> list:
+    """filter-then-load: the circle chunks the authenticated `asker` may see → (name, body). Fail closed: an
+    anon/unknown asker, or a chunk with no/empty audience, yields NOTHING. Exact backend-matched handle, no fuzzy.
+    Two sources, gated identically: (1) hand-written ~/.jm/circles/*.md with `audience:` front-matter, and (2) SOURCE
+    circles in ~/.jm/circles.json that point at existing files by glob (no copying — current + future matches)."""
+    a = (asker or "").strip().lower()
+    if not a or a == "someone":
+        return []                                    # anon / unknown asker → never any circle content
+    out = []
+    cdir = _circles_dir()
+    if cdir.exists():
+        for f in sorted(cdir.glob("*.md")):
+            try:
+                aud, body = _parse_audience(f.read_text("utf-8", errors="ignore"))
+            except Exception:
+                continue
+            if not aud:                              # no key or [] → private, deny
+                continue
+            if "public" in aud or a in aud:
+                out.append((f.name, body))
+    for name, spec in _load_circles_json().items():
+        aud = [str(h).strip().lower() for h in (spec.get("audience") or [])]
+        if not ("public" in aud or a in aud):        # default-deny: asker not in this circle's audience
+            continue
+        for pat in (spec.get("include") or []):
+            for p in _resolve_glob(pat):
+                try:
+                    out.append((f"{name}/{p.name}", p.read_text("utf-8", errors="ignore")))
+                except Exception:
+                    pass
+    return out
+
+
 def build_public_view() -> tuple[int, int]:
     """Structural INPUT-EXCLUDE: mirror memory .md files MINUS the private globs into PUBLIC_VIEW. The answerer is
     pointed ONLY here, so private files physically never enter its context. Returns (kept, excluded)."""
@@ -604,13 +733,27 @@ def build_public_view() -> tuple[int, int]:
         except Exception:
             pass
     kept = excl = 0
+    circle_paths = _circle_include_paths()       # files a circles.json circle points at → private-to-audience, not public
     for root in MEMORY_ROOTS:
         for f in root.glob("**/memory/*.md"):
             if _is_private(f):
                 excl += 1
                 continue
             try:
-                shutil.copy2(f, PUBLIC_VIEW / f.name)
+                if f.resolve() in circle_paths:  # pointed at by a circle → served ONLY via the gate, never public
+                    excl += 1
+                    continue
+            except Exception:
+                pass
+            try:
+                txt = f.read_text("utf-8", errors="ignore")
+            except Exception:
+                continue
+            if _audience_tag_loose(txt):         # circle/audience-tagged content belongs in the gate, NEVER in PUBLIC_VIEW
+                excl += 1
+                continue
+            try:
+                (PUBLIC_VIEW / f.name).write_text(txt, "utf-8")
                 kept += 1
             except Exception:
                 pass
@@ -620,11 +763,44 @@ def build_public_view() -> tuple[int, int]:
     kfile = JM_HOME / "knowledge.md"
     if kfile.exists() and not _is_private(kfile):
         try:
-            shutil.copy2(kfile, PUBLIC_VIEW / "knowledge.md")
-            kept += 1
+            ktxt = kfile.read_text("utf-8", errors="ignore")
+            if not _audience_tag_loose(ktxt):     # a stray audience tag in knowledge.md must NOT leak to public either
+                (PUBLIC_VIEW / "knowledge.md").write_text(ktxt, "utf-8")
+                kept += 1
         except Exception:
             pass
     return kept, excl
+
+
+def _seed_knowledge_from_topics(public: list[str], friends: list[str]) -> bool:
+    """Create the curated Codex knowledge seed when there is no public answer context yet.
+    This writes ONLY human-approved topic labels, never raw transcripts/history."""
+    topics = [t for t in public + friends if t]
+    if not topics:
+        return False
+    kfile = JM_HOME / "knowledge.md"
+    try:
+        existing = kfile.read_text("utf-8", errors="ignore") if kfile.exists() else ""
+    except Exception:
+        existing = ""
+    if len(existing.strip()) >= 80:
+        return False
+    try:
+        JM_HOME.mkdir(parents=True, exist_ok=True)
+        kfile.write_text(
+            "# Public knowledge seed\n\n"
+            "Codex nodes answer only from this curated file plus private-filtered memory notes. "
+            "This seed contains only topic labels you approved during onboarding, not raw chat history. "
+            "For broad routing questions, it is enough to say the human opted in to help with these topics; "
+            "for detailed questions, skip until the human expands this file with concrete public notes.\n\n"
+            "Public topics:\n" + "".join(f"- {t}\n" for t in public) +
+            "\nBroad public answer context:\n" +
+            "".join(f"- The human opted in to help with {t}.\n" for t in public) +
+            ("\nFriends-only topics:\n" + "".join(f"- {t}\n" for t in friends) if friends else ""),
+            "utf-8")
+        return True
+    except Exception:
+        return False
 
 
 def _onboarding_text(max_chars: int = 2_000_000) -> tuple[str, str, int, int]:
@@ -654,11 +830,14 @@ def _onboarding_text(max_chars: int = 2_000_000) -> tuple[str, str, int, int]:
     return _read_history(), "raw-history", kept, excl
 
 
-def _gather_public_context(question: str, budget: int = 80_000, per_file: int = 12_000) -> str:
+def _gather_public_context(question: str, asker: str = "", allow_circles: bool = False,
+                           budget: int = 80_000, per_file: int = 12_000) -> str:
     """Select the PUBLIC-only notes (already private-filtered into PUBLIC_VIEW) most relevant to the question, in
     PYTHON, and return them to INLINE into the prompt. The answerer model gets NO tools, so it can only ever see
     what we pick here — the structural exclude is enforced by what we DON'T paste, not by a sandbox we proved is
-    permeable. Crude keyword overlap for v1 (HyDE can sharpen recall later); zero-overlap notes are dropped."""
+    permeable. Crude keyword overlap for v1 (HyDE can sharpen recall later); zero-overlap notes are dropped.
+    When allow_circles (non-network questions only), ALSO inline the circle chunks THIS asker is authorized for
+    (filter-then-load) — the forbidden chunks are simply never pasted, so they never reach the model."""
     qwords = {w for w in re.split(r"[^a-zа-я0-9]+", question.lower()) if len(w) > 2 and w not in _STOP}
     scored = []
     for f in sorted(PUBLIC_VIEW.glob("*.md")):
@@ -678,15 +857,23 @@ def _gather_public_context(question: str, budget: int = 80_000, per_file: int = 
         n += len(snippet)
         if n >= budget:
             break
+    # circle v1: ALSO inline the PRIVATE chunks this specific asker is authorized for (already access-filtered by
+    # _circle_chunks_for). Only when allow_circles=True (non-network questions → parked, never showcased).
+    if allow_circles and asker:
+        for name, body in _circle_chunks_for(asker):
+            fw = {w for w in re.split(r"[^a-zа-я0-9]+", body.lower()) if len(w) > 2}
+            if qwords & fw:                  # same relevance bar as public notes
+                out.append(f"## PRIVATE NOTE (shared with you, {asker} — {name}):\n{body[:per_file]}")
     return "\n\n".join(out)
 
 
-def _claude_answer(question: str, brain=None) -> str:
-    """PASS 1 — a MEASURED answer drawn ONLY from inlined PUBLIC notes, with the model given NO filesystem tools
-    (so a prompt-injected question cannot make it read private files — verified that --add-dir is not a real
-    sandbox). The untrusted question is fenced and the model is told never to obey instructions inside it. SKIP if
-    the notes don't genuinely cover it. `brain` is captured ONCE by the caller (no TOCTOU between draft & redact)."""
-    ctx = _gather_public_context(question)
+def _claude_answer(question: str, brain=None, asker: str = "", allow_circles: bool = False) -> str:
+    """PASS 1 — a MEASURED answer drawn ONLY from inlined PUBLIC notes (+ the asker's authorized circle chunks when
+    allow_circles), with the model given NO filesystem tools (so a prompt-injected question cannot make it read
+    private files — verified that --add-dir is not a real sandbox). The untrusted question is fenced and the model
+    is told never to obey instructions inside it. SKIP if the notes don't genuinely cover it. `brain` is captured
+    ONCE by the caller (no TOCTOU between draft & redact)."""
+    ctx = _gather_public_context(question, asker=asker, allow_circles=allow_circles)
     if not ctx.strip():
         return "SKIP"
     persona = (
@@ -776,6 +963,10 @@ def _answer_pass(token: str, topics: list[str], drafter=None, redactor=None,
     for q in getter("/mp/board", token).get("open", []):
         qid, text = q["qid"], q["text"]
         vis = q.get("visibility", "network")
+        asker = (q.get("from") or "").strip()
+        # circle v1: include the asker's authorized PRIVATE chunks ONLY on non-network questions — those are PARKED
+        # below (never auto-posted/showcased), so circle content reaches only the named asker, via your review.
+        allow_circles = (vis != "network")
         # Resolve the brain ONCE per question and thread the SAME callable through draft + redact + gate. This closes
         # the TOCTOU where a token appearing/disappearing mid-sweep would (a) let a Codex draft auto-post as if Claude
         # wrote it, or (b) split draft and redact across two different models.
@@ -784,16 +975,20 @@ def _answer_pass(token: str, topics: list[str], drafter=None, redactor=None,
             print(f"  [skip] {qid} — no brain configured (run `claude setup-token`, or install codex)")
             continue
         try:
-            draft = drafter(text, topics) if drafter else _claude_answer(text, brain)
+            draft = drafter(text, topics) if drafter else _claude_answer(text, brain, asker=asker, allow_circles=allow_circles)
         except Exception as e:
             print(f"  [skip] brain error ({e.__class__.__name__}) — is the brain set up + on PATH?")
             continue
-        if not draft or draft.strip().upper().startswith("SKIP"):
-            print(f"  [skip] {qid} — don't genuinely know; left for someone who does")
-            continue
+        skipped = (not draft) or draft.strip().upper().startswith("SKIP")
         if vis != "network":
-            pend(qid, text, draft, vis)                          # sensitive → always human opt-in
-            print(f"  [pending] {qid} ({vis}) — sensitive; review with: join.py --pending")
+            # friends/anon = a person-to-person message → ALWAYS surface to the human, even if the agent couldn't
+            # auto-draft. An addressed 'dm-lite' question must REACH you, never be dropped on SKIP; reply with --send.
+            note = draft if not skipped else "(no auto-draft — your agent didn't have an answer; reply manually)"
+            pend(qid, text, note, vis)
+            print(f"  [pending] {qid} ({vis}) — {'review' if not skipped else 'addressed/no-draft'}: join.py --pending")
+            continue
+        if skipped:
+            print(f"  [skip] {qid} — don't genuinely know; left for someone who does")
             continue
         try:
             safe = redactor(text, draft) if redactor else _redact(text, draft, brain)
@@ -822,7 +1017,10 @@ def serve(token: str, once: bool = False, topics=None) -> None:
     import time
     topics = topics or []
     kept, excl = build_public_view()      # structural input-exclude: private files never enter the answerer
-    brain = "claude (your subscription)" if _oauth_token() else "NONE — run `claude setup-token` first!"
+    kind = _brain_kind()
+    brain = {"claude": "claude (your subscription)",
+             "codex": "codex",
+             "none": "NONE — run `claude setup-token` or install/login to `codex` first!"}.get(kind, kind)
     print(f"transmitter up — brain={brain}; public memory view = {kept} files ({excl} private excluded) at "
           f"{PUBLIC_VIEW}; polling every {POLL_SECONDS}s. Raw memory + private files NEVER leave; answers are "
           f"redacted fail-closed before posting.")
@@ -868,9 +1066,12 @@ def _claude_bin() -> str:
 
 
 def _launchd_path_env() -> str:
-    """A minimal but sufficient PATH so the launchd daemon can find `claude` (+ its node runtime)."""
+    """A minimal but sufficient PATH so launchd can find `claude`/`codex` (+ their runtimes)."""
+    import shutil
     cb = _claude_bin()
-    parts = [str(Path(cb).parent), str(Path.home() / ".local" / "bin"),
+    codex = shutil.which("codex")
+    parts = [str(Path(cb).parent), str(Path(codex).parent) if codex else "",
+             str(Path.home() / ".local" / "bin"),
              "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     seen, out = set(), []
     for p in parts:
@@ -1118,6 +1319,37 @@ def _suggested_handle() -> str:
     return re.sub(r"[^a-z0-9_\-]", "", cand)
 
 
+def _add_remote_mcp() -> None:
+    """Wire the remote MCP into the user's Claude Code so the network tools (ask_network/check_answers/who_knows)
+    appear WITHOUT a manual `claude mcp add`. Their OWN config; no secrets. Best-effort. (#4)"""
+    import subprocess, shutil
+    url = RELAY.rstrip("/") + "/mcp"
+    if shutil.which("claude"):
+        try:
+            r = subprocess.run([_claude_bin(), "mcp", "add", "--transport", "http", "multiplayer", url],
+                               timeout=30, capture_output=True, text=True)
+            if r.returncode == 0 or "already" in (r.stderr + r.stdout).lower():
+                print(f"  ✓ network tools added to Claude Code (multiplayer → {url}). Restart Claude Code to use them.")
+            else:
+                print(f"  (add it yourself if you want them: claude mcp add --transport http multiplayer {url})")
+        except Exception:
+            print(f"  (add it yourself: claude mcp add --transport http multiplayer {url})")
+    if shutil.which("codex"):                       # Codex schema varies → print the line, don't risk writing a bad config
+        print(f"  Codex: add an MCP server 'multiplayer' (http, url {url}) to ~/.codex/config.toml.")
+
+
+def _maybe_add_mcp(a) -> None:
+    if getattr(a, "no_mcp", False):
+        return
+    if getattr(a, "add_mcp", False):
+        _add_remote_mcp(); return
+    try:
+        if sys.stdin.isatty() and input("\n  add the network tools to your Claude Code/Codex now? [Y/n] ").strip().lower() in ("", "y", "yes"):
+            _add_remote_mcp()
+    except Exception:
+        pass
+
+
 def _onboard(a) -> None:
     """The self-driving connector the agent runs once. TWO human touchpoints only: the privacy split (decided BEFORE
     this call and passed as --public/--friends) and the single browser Authorize click during token mint. Staged +
@@ -1131,7 +1363,11 @@ def _onboard(a) -> None:
         text, _src, kept, excl = _onboarding_text()
         if len(text) < 200:
             print(json.dumps({"step": "propose", "topics": {"public": [], "friends": []},
-                              "note": "No local AI history found — nothing to distill. You can still --ask."},
+                              "suggested_handle": _suggested_handle(),
+                              "note": ("No local AI history found. Ask the human for 2-3 public topics they want "
+                                       "to be known for, then re-run: uvx joinmultiplayer --onboard --public "
+                                       "\"topic one,topic two\" --friends \"\" --name <handle>. Codex nodes answer "
+                                       "from ~/.jm/knowledge.md; onboarding will seed it from those approved topics.")},
                              ensure_ascii=False))
             return
         topics = _distill(text)[:50]               # top seed terms; the agent refines/clusters these with the human
@@ -1179,8 +1415,10 @@ def _onboard(a) -> None:
     #    claim so a brain failure can never orphan a node. A Codex-only user reaches the `elif` and skips the Claude mint.
     JM_HOME.mkdir(parents=True, exist_ok=True)
     import shutil as _sh
+    active_brain = "none"
     if _oauth_token():                                          # Claude token already present → just verify it
         if _health_check():
+            active_brain = "claude"
             print("\n  ✓ Your Claude subscription is the brain — existing token works, skipping mint.")
         else:
             print("\n  ⚠️ Claude token present but the health check failed (try: claude -p 'say OK'). Fix or --revoke, "
@@ -1196,12 +1434,14 @@ def _onboard(a) -> None:
         if not _health_check():
             print(f"  ⚠️  Token captured but the health check failed (try: claude -p 'say OK'). Nothing installed; "
                   f"token at {CLAUDE_TOKEN_PATH} — remove with join.py --revoke, then re-run."); return
+        active_brain = "claude"
         print("  ✓ subscription token verified — your agent can answer.")
     elif _sh.which("codex"):                                   # Codex is the brain — no Claude needed, no token to mint
         print("\n  Your Codex CLI is the brain (no Claude, no token to mint — it uses your `codex login`). Verifying…")
         if not _health_check():                                # _health_check runs the active brain (= _codex here)
             print("  ✋ codex didn't return a clean answer. Check `codex login` (or OPENAI_API_KEY), then try "
                   "`python3 ~/.jm/join.py --codex-canary` to debug. Nothing registered/installed."); return
+        active_brain = "codex"
         print("  ✓ codex verified — your agent can answer from your knowledge.")
         print("  ℹ️  Codex node is PARK-ONLY by default (drafts → you review with --pending → --send). To AUTO-post, "
               "run `--codex-canary` then set JM_CODEX_SANDBOX_VERIFIED=1 + JM_CODEX_AUTOPOST=1.")
@@ -1246,6 +1486,12 @@ def _onboard(a) -> None:
         except Exception: pass
         print(f"  ✓ registered as '{res.get('handle','you')}'")
     _register({"public": public, "friends": friends}, token)
+    if active_brain == "codex":
+        kept, _excl = build_public_view()
+        if kept == 0 and _seed_knowledge_from_topics(public, friends):
+            build_public_view()
+            print(f"  ✓ Codex nodes answer from {JM_HOME / 'knowledge.md'} — seeded it from your approved topics; "
+                  "add concrete public notes there to improve drafts.")
 
     # ── STAGE 5 — always-on transmitter. macOS = launchd; other OSes don't have it wired yet → register-only +
     #    HONEST message (never a silently-dead node). Cross-OS service (systemd/schtasks) is the next build.
@@ -1257,7 +1503,11 @@ def _onboard(a) -> None:
                "only), with a fail-closed redactor before anything posts. Sensitive/friends questions are parked for you.")
         plist = _install_launchd(token, topics_csv=",".join(public))
         print(f"  ✓ installed: {plist}   (logs → {JM_HOME / 'transmitter.log'})")
-        print("\n  🛰  You're live — online whenever this Mac is on; your agent answers public questions without asking.")
+        if active_brain == "codex" and not _codex_autopost_ok():
+            print("\n  🛰  You're live — online whenever this Mac is on; Codex DRAFTS answers and PARKS them for "
+                  "your review (--pending → --send). Nothing posts without you.")
+        else:
+            print("\n  🛰  You're live — online whenever this Mac is on; your agent answers public questions without asking.")
     else:
         print(f"\n  ✓ Registered as a node — but the ALWAYS-ON auto-answerer is macOS-only for now (cross-OS service is "
               f"coming; honest about it so you're never 'online but silently answering nothing').")
@@ -1265,6 +1515,7 @@ def _onboard(a) -> None:
         print(f"     run it live : python3 {JM_HOME / 'join.py'} --serve --token <relay-token from {JM_HOME / 'relay_token'}>")
         print(f"     or by hand  : --inbox (see questions routed to you) → --answer <qid> --text \"...\"")
         print(f"  And you can ASK the network now:  --ask \"your question\"  ·  read replies:  --inbox")
+    _maybe_add_mcp(a)                                # #4: offer to wire the network tools into Claude Code/Codex (no manual step)
     print( "  Off-switch any time:")
     print(f"     stop/pause : python3 {JM_HOME / 'join.py'} --uninstall")
     print(f"     revoke key : python3 {JM_HOME / 'join.py'} --revoke")
@@ -1291,16 +1542,28 @@ def main() -> None:
     ap.add_argument("--note", default="")                       # optional note attached to --befriend
     ap.add_argument("--pending", action="store_true")           # list friends/anon drafts awaiting approval
     ap.add_argument("--ask", default="")                        # ask the network a question (async; answers land in --inbox)
+    ap.add_argument("--to", default="")                         # addressed ask: --ask "..." --to <friend> → straight to them
     ap.add_argument("--inbox", action="store_true")            # read answers to your questions + questions routed to you
     ap.add_argument("--answer", default="")                    # answer a routed question: --answer <qid> --text "..."
     ap.add_argument("--text", default="")                      # body for --answer
     ap.add_argument("--json", action="store_true")            # machine-readable output (for the agent answerer loop)
     ap.add_argument("--send", default=""); ap.add_argument("--skip", default=""); ap.add_argument("--edit", default="")
     ap.add_argument("--token", default=os.environ.get("JM_TOKEN", ""))
+    ap.add_argument("--yes", action="store_true")                           # skip the interactive confirm (scripts/agents)
+    ap.add_argument("--add-mcp", dest="add_mcp", action="store_true")       # wire the remote MCP into Claude Code (#4)
+    ap.add_argument("--no-mcp", dest="no_mcp", action="store_true")         # skip the MCP offer during --onboard
     ap.add_argument("--name", default="")                                   # display handle for CLI self-join
     ap.add_argument("--public", default=""); ap.add_argument("--friends", default="")
     ap.add_argument("--import-chatgpt", dest="import_chatgpt", default="")   # path to conversations.json or its .zip
     a = ap.parse_args()
+
+    if not a.token:                                  # auto-read the saved node token → every command "just works", no manual paste
+        rt0 = JM_HOME / "relay_token"
+        if rt0.exists():
+            try:
+                a.token = rt0.read_text("utf-8").strip()
+            except Exception:
+                pass
 
     if a.onboard:
         _onboard(a); return
@@ -1316,7 +1579,22 @@ def main() -> None:
     if a.befriend:
         if not a.token:
             print("  need --token (your node's relay token) to send a friend request."); sys.exit(1)
-        r = _api_post("/friend/request", {"to": a.befriend.strip(), "note": a.note}, a.token)
+        tgt = a.befriend.strip()
+        # friend-confirm: backend matches the EXACT nick (no fuzzy → can't land on an impostor), but a typo is easy.
+        # Confirm interactively (unless --yes / non-TTY), and show a CLEAN error on an unknown nick (no traceback).
+        if sys.stdin.isatty() and not a.yes:
+            if input(f"  send a friend request to '{tgt}'? (exact nick — backend-matched, no fuzzy) [y/N] ").strip().lower() not in ("y", "yes"):
+                print("  cancelled."); return
+        try:
+            r = _api_post("/friend/request", {"to": tgt, "note": a.note}, a.token)
+        except Exception as e:
+            msg = getattr(e, "read", lambda: b"")() if hasattr(e, "read") else b""
+            try:
+                detail = json.loads(msg).get("detail", "")
+            except Exception:
+                detail = ""
+            print(f"  ✋ couldn't send to '{tgt}': {detail or 'no user has that exact nick (nicks are case-exact, no fuzzy match).'}")
+            return
         if r.get("already_friends"):
             print(f"  ✓ you're already friends with '{a.befriend}'.")
         elif r.get("pending"):
@@ -1374,7 +1652,10 @@ def main() -> None:
     if a.ask:
         if not a.token:
             print("  need --token to ask as your node (register first: join.py --register --name <handle>)."); sys.exit(1)
-        r = _api_post("/mp/ask", {"text": a.ask}, a.token)
+        payload = {"text": a.ask}
+        if getattr(a, "to", "").strip():                 # addressed ask ('dm-lite'): straight to a FRIEND, bypass topic-match
+            payload["to"] = a.to.strip(); payload["visibility"] = "friends"
+        r = _api_post("/mp/ask", payload, a.token)
         print(f"  🛰  {r.get('message','asked')}")
         if r.get("routed_to"):
             print(f"     routed to: {', '.join(r['routed_to'])}  (online now: {r.get('online_count', 0)})")
@@ -1451,7 +1732,9 @@ def main() -> None:
     else:
         text, _src, _kept, _excl = _onboarding_text()
         if len(text) < 200:
-            print("  no AI history found locally (Claude Code / Codex). Nothing to distill — you can still ASK.")
+            print("  no AI history found locally (Claude Code / Codex). Tell your agent 2-3 public topics, then run:")
+            print("     uvx joinmultiplayer --onboard --public \"topic one,topic two\" --friends \"\" --name <handle>")
+            print("  Codex nodes answer from ~/.jm/knowledge.md; onboarding will seed it from those approved topics.")
             return
         all_topics = _distill(text)
         split = _propose(all_topics[:_PROPOSE_CAP])
@@ -1461,13 +1744,33 @@ def main() -> None:
     print(json.dumps({"proposed": split, "rule": "≥10% public (give-to-get); raw history never leaves device"},
                      ensure_ascii=False, indent=2))
     if a.register:
+        # PUBLISH is an explicit, CONSENTED step — never a silent side-effect of "register". The split was just
+        # previewed above; confirm before any label leaves the device. (#3: separate 'create identity' from 'publish'.)
+        if not a.yes:
+            if sys.stdin.isatty():
+                if input("\n  publish these labels to the network now? (raw history stays local — labels only) [y/N] ").strip().lower() not in ("y", "yes"):
+                    print("  not published. Edit the split, then re-run with --yes (or explicit --public \"...\") when ready.")
+                    return
+            else:
+                print("\n  ⛔ preview only — NOT published. Show the human the split above, then re-run with --yes (or an "
+                      "explicit --public \"...\" --friends \"...\"). We never publish your topics without consent.")
+                return
         token = a.token
         if not token:
-            # CLI-first: no web sign-in — mint the identity right here.
-            res = _self_join(a.name)
+            res = _self_join(a.name)              # CLI-first: mint the identity (no web sign-in)
             token = res["token"]
-            print(f"  ✓ you're registered as '{res['handle']}'. SAVE THIS TOKEN to also ask from web/Telegram "
-                  f"later: {token}")
+            print(f"  ✓ registered as '{res['handle']}'.")
+        rt = JM_HOME / "relay_token"              # PERSIST (chmod 600) so later commands auto-read it — no manual --token paste
+        try:
+            JM_HOME.mkdir(parents=True, exist_ok=True)
+            rt.write_text(token + "\n", "utf-8")
+            try:
+                os.chmod(rt, 0o600)
+            except Exception:
+                pass
+            print(f"  🔑 token saved to {rt} (used automatically; also for web/Telegram linking).")
+        except Exception:
+            pass
         _register(split, token)
     else:
         print("\n  AGENT: this was just a read-only PREVIEW. To actually make your human a live NODE, move topics if "
